@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import json
 import logging
+from collections import defaultdict, deque
 
 import requests
 from fastapi import FastAPI, Request
@@ -12,10 +13,10 @@ import uvicorn
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# --------- ЗАГРУЗКА .env ---------
+# --------- ЗАГРУЗКА .env (для локальной разработки) ---------
 load_dotenv()
 
-# --------- ЛОГИ ---------
+# --------- НАСТРОЙКА ЛОГИРОВАНИЯ ---------
 logging.basicConfig(
     level=logging.INFO,
     format="INFO:ig-webhook:%(message)s"
@@ -23,30 +24,47 @@ logging.basicConfig(
 
 app = FastAPI()
 
-# --------- ENV ---------
+# --------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---------
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "VERIFY_TOKEN")
 APP_SECRET = os.getenv("APP_SECRET", "APP_SECRET")
 PAGE_TOKEN = os.getenv("PAGE_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
+IG_USER_ID = os.getenv("IG_USER_ID", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --------- ВЕРИФИКАЦИЯ WEBHOOK ---------
+# --------- ПАМЯТЬ ДЛЯ ДИАЛОГОВ ---------
+# Для каждого пользователя храним до 10 последних сообщений
+MAX_CONTEXT_MESSAGES = 10
+conversations = defaultdict(lambda: deque(maxlen=MAX_CONTEXT_MESSAGES))
+
+
+def add_to_history(user_id: str, role: str, content: str):
+    """Сохранить сообщение в истории диалога с пользователем."""
+    conversations[user_id].append({"role": role, "content": content})
+
+
+def get_history(user_id: str):
+    """Вернуть историю для пользователя в виде списка messages."""
+    return list(conversations[user_id])
+
+
+# --------- ВЕРИФИКАЦИЯ WEBHOOK (GET) ---------
 @app.get("/webhook")
 async def verify(request: Request):
     params = request.query_params
 
     if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
         challenge = params.get("hub.challenge")
-        logging.info("✅ Webhook verified successfully")
+        logging.info("✅ Webhook verified")
         return PlainTextResponse(challenge)
 
     logging.info("❌ Webhook verification failed")
     return PlainTextResponse("Verification failed", status_code=403)
 
 
-# --------- ПРИЁМ И ОТВЕТ МЕССЕНДЖЕРА ---------
+# --------- ПРИЁМ СОБЫТИЙ ОТ META (POST) ---------
 @app.post("/webhook")
 async def webhook(request: Request):
     raw_body = await request.body()
@@ -63,78 +81,95 @@ async def webhook(request: Request):
     logging.info(f"📩 incoming event: {json.dumps(data, ensure_ascii=False)}")
 
     try:
-        for entry in data.get("entry", []):
-            for msg in entry.get("messaging", []):
-                message = msg.get("message")
+        entry = data["entry"][0]
+        messaging = entry.get("messaging", [])
 
-                # пропуск системных событий
-                if not message:
-                    continue
+        for msg in messaging:
+            message = msg.get("message")
 
-                # нельзя отвечать на свои же сообщения
-                if message.get("is_echo"):
-                    logging.info("↩ Skip echo")
-                    continue
+            # если нет блока message — например, это событие message_edit и т.п.
+            if not message:
+                continue
 
-                sender_id = msg["sender"]["id"]
-                text = message.get("text", "")
+            # игнорируем эхо (сообщения, отправленные самим бизнес-аккаунтом)
+            if message.get("is_echo"):
+                logging.info("↩ Skip echo")
+                continue
 
-                logging.info(f"💬 Message from {sender_id}: {text}")
+            sender_id = msg["sender"]["id"]
+            text = message.get("text", "")
 
-                # Генерация ответа GPT
-                reply = generate_ai_reply(text)
+            logging.info(f"💬 Message from {sender_id}: {text}")
 
-                # Отправка ответа
-                send_message(sender_id, reply)
+            # Добавляем запрос в историю диалога
+            add_to_history(sender_id, "user", text)
 
-                logging.info(f"✅ Reply sent to {sender_id}")
+            # Генерируем ответ с учётом истории
+            reply_text = generate_ai_reply(sender_id)
+
+            # Добавляем ответ в историю
+            add_to_history(sender_id, "assistant", reply_text)
+
+            # Отправляем ответ
+            send_message(sender_id, reply_text)
+            logging.info(f"✅ Reply sent to {sender_id}")
 
     except Exception as e:
-        logging.info(f"⚠ ERROR: {e}")
+        logging.info(f"⚠ error: {e}")
 
     return {"status": "ok"}
 
 
-# --------- GPT: ЛОГИКА ОТВЕТА ---------
-def generate_ai_reply(user_text: str) -> str:
+# --------- GPT: ГЕНЕРАЦИЯ ПРОДАЮЩЕГО ОТВЕТА ---------
+def generate_ai_reply(user_id: str) -> str:
+    """
+    Логика ИИ-продавца с короткой памятью по диалогу.
+    """
 
-    base_prompt = """
-Ты — виртуальный продавец магазина бытовой химии Instagram @optomtovary89.
+    base_system_prompt = """
+Ты — виртуальный продавец магазина бытовой химии в Instagram-аккаунте @optomtovary89.
 
-Правила общения:
-1. НЕ ПРИВЕТСТВУЙ, если клиент писал раньше — сразу переходи к ответу.
-2. Отвечай коротко, по существу, как реальный продавец.
-3. Помни ассортимент: бытовая химия, стирка, уборка, посуда, освежители, гели, порошки.
-4. Если клиент спрашивает "что есть?" — выдавай список категорий и предложи уточнить бюджет.
-5. Если вопрос не по теме — мягко возвращай к товарам.
-6. Никогда не используй длинные официозные фразы. Отвечай как продавец с реального аккаунта.
+Главные правила общения:
+1. Приветствуй клиента ТОЛЬКО в самом начале диалога. Если в истории есть предыдущие сообщения, сразу отвечай по делу без повторных приветствий и представлений.
+2. Отвечай коротко и по существу, без лишних общих фраз.
+3. Всегда помни, что ты консультант по бытовой химии и товарам из этого Instagram.
+4. Если спрашивают не по теме магазина — мягко возвращай разговор к товарам и вопросам по покупкам.
+5. Если информации не хватает, честно скажи, чего именно не хватает, и попроси уточнить: объём, фото, пример и т.д.
+
+Когда продолжаешь диалог, ориентируйся на предыдущие сообщения в истории и не начинай с нуля.
 """
 
-    system_prompt = SYSTEM_PROMPT or base_prompt
+    system_prompt = SYSTEM_PROMPT or base_system_prompt
 
     if not OPENAI_API_KEY:
-        return "Извините, сервис временно недоступен."
+        logging.info("❗ OPENAI_API_KEY is not set")
+        return "Извините, сейчас сервер не настроен. Попробуйте позже."
+
+    # История диалога для пользователя
+    history = get_history(user_id)
+
+    messages = [{"role": "system", "content": system_prompt}] + history
 
     try:
         completion = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
+            messages=messages,
         )
 
         reply = completion.choices[0].message.content.strip()
-        return reply or "Напишите, что именно вас интересует."
+        if not reply:
+            return "Извините, сейчас не могу ответить. Напишите, пожалуйста, чуть позже."
+
+        return reply
 
     except Exception as e:
-        logging.info(f"❌ OpenAI error: {e}")
-        return "Пока не могу ответить — попробуйте чуть позже."
+        logging.info(f"OpenAI error: {e}")
+        return "Извините, сейчас есть небольшие технические неполадки. Менеджер ответит вам позже."
 
 
-# --------- ОТПРАВКА СООБЩЕНИЯ В INSTAGRAM ---------
+# --------- ОТПРАВКА СООБЩЕНИЯ В DIRECT ---------
 def send_message(recipient_id: str, text: str):
-    url = f"https://graph.facebook.com/v24.0/me/messages?access_token={PAGE_TOKEN}"
+    url = f"https://graph.facebook.com/v21.0/me/messages?access_token={PAGE_TOKEN}"
 
     payload = {
         "recipient": {"id": recipient_id},
